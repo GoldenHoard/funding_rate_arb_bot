@@ -1,0 +1,11 @@
+# Lambda runtime dependencies
+# Install into a local package directory for Lambda Layer or zip deployment:
+#   pip install -r requirements.txt -t ./package --platform manylinux2014_x86_64 \
+#               --implementation cp --python-version 3.12 --only-binary=:all:
+
+ccxt>=4.2.0
+aiohttp>=3.9.0
+
+# boto3 is pre-installed in the Lambda runtime. Only needed for local testing:
+#   pip install boto3
+

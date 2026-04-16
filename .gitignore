@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Lambda build artifacts
+package/
+*.zip
+
+# Logs
+logs/
+
+# OS
+.DS_Store
