@@ -5,8 +5,8 @@ AWS Lambda Function | Binance USDⓈ-M Perpetuals + Spot
 
 Strategy Logic:
   1. Scan ALL Binance USDM perpetuals for positive funding rates
-  2. Filter out coins with < $50M 24h volume on EITHER spot or futures leg
-  3. Rank by funding rate descending; select top 3 candidates
+  2. Filter out coins below MIN_VOLUME_USD on either leg + optional MIN_LEG_VOLUME_RATIO
+  3. Rank by funding rate descending; select TOP_N candidates (default 3)
   4. Pre-trade slippage/spread check: abort individual coin if > 0.2%
   5. Concurrently fire: Market BUY Spot + Market SELL (Short) Futures @ 1x leverage
   6. On any leg imbalance (one fills, one fails): raise CRITICAL and halt execution
@@ -55,20 +55,27 @@ logger.setLevel(logging.INFO)
 CAPITAL_PER_LEG_USD: float = float(os.environ.get("CAPITAL_PER_LEG_USD", "1000.0"))
 
 # Number of top-ranked candidates to trade
-TOP_N: int = 3
+TOP_N: int = int(os.environ.get("TOP_N", "3"))
 
-# 24h quote volume floor for BOTH spot and futures legs
-MIN_VOLUME_USD: float = 50_000_000  # $50M
+# 24h quote volume floor for BOTH spot and futures legs (USDT quoted).
+# Env MIN_VOLUME_USD — default loosened from $50M to $25M for more opportunities.
+MIN_VOLUME_USD: float = float(os.environ.get("MIN_VOLUME_USD", "25000000"))
 
-# Maximum tolerated combined slippage (spot + futures) before aborting
-MAX_SLIPPAGE_PCT: float = 0.002  # 0.2%
+# Minimum min(spot,futures) / max(spot,futures) 24h volume ratio.
+# Rejects one-sided hype (thin spot + hot perp) — a common cause of bad fills despite high APY.
+# Set to 0 to disable this filter entirely.
+MIN_LEG_VOLUME_RATIO: float = float(os.environ.get("MIN_LEG_VOLUME_RATIO", "0.2"))
+
+# Maximum tolerated combined slippage (worst of VWAP slip vs cross-spread) before aborting.
+MAX_SLIPPAGE_PCT: float = float(os.environ.get("MAX_SLIPPAGE_PCT", "0.002"))
+
+# Order book depth levels for VWAP simulation (more levels = stabler estimate on wide books).
+ORDER_BOOK_LIMIT: int = int(os.environ.get("ORDER_BOOK_LIMIT", "40"))
 
 # Minimum 8h funding rate required to OPEN a new position.
-# Below this threshold the carry doesn't justify fees + operational risk.
-# Default: 0.0003 = 0.03% per 8h ≈ 32.85% APY
-# Set via env var MIN_FUNDING_RATE_TO_OPEN to tune without redeploying.
+# Default: 0.00008 ≈ ~8.8% gross APY (before fees/slippage). Tune MIN_FUNDING_RATE_TO_OPEN in .env.
 MIN_FUNDING_RATE_TO_OPEN: float = float(
-    os.environ.get("MIN_FUNDING_RATE_TO_OPEN", "0.0003")
+    os.environ.get("MIN_FUNDING_RATE_TO_OPEN", "0.00008")
 )
 
 # Binance pays/charges funding every 8 hours → 3 × 365 periods per year
@@ -273,6 +280,16 @@ async def fetch_top_candidates(
             )
             continue
 
+        if MIN_LEG_VOLUME_RATIO > 0:
+            vmax = max(spot_vol, futures_vol)
+            if vmax > 0 and min(spot_vol, futures_vol) / vmax < MIN_LEG_VOLUME_RATIO:
+                logger.debug(
+                    f"SKIP {base}: leg volume imbalance "
+                    f"(spot ${spot_vol/1e6:.1f}M vs fut ${futures_vol/1e6:.1f}M "
+                    f"< ratio {MIN_LEG_VOLUME_RATIO:.0%})"
+                )
+                continue
+
         candidates.append(TradeCandidate(
             symbol=base,
             funding_rate=funding_rate,
@@ -330,8 +347,8 @@ async def check_slippage_and_bbo(
     """
     try:
         spot_ob, futures_ob = await asyncio.gather(
-            spot_ex.fetch_order_book(candidate.spot_symbol, limit=20),
-            futures_ex.fetch_order_book(candidate.futures_symbol, limit=20),
+            spot_ex.fetch_order_book(candidate.spot_symbol, limit=ORDER_BOOK_LIMIT),
+            futures_ex.fetch_order_book(candidate.futures_symbol, limit=ORDER_BOOK_LIMIT),
         )
     except Exception as exc:
         raise RuntimeError(

@@ -13,9 +13,9 @@ Long Spot  +  Short Perpetual  =  Zero directional exposure, collect funding
 ### Execution Flow
 
 1. **Scan** — Fetch funding rates for all Binance USDⓈ-M perpetuals
-2. **Filter** — Remove coins below the minimum funding rate threshold or with < $50M 24h volume (spot & futures)
-3. **Rank** — Sort by funding rate descending, select top 3 candidates
-4. **Pre-trade checks** — Fetch orderbook BBO, calculate expected slippage, abort if spread > 0.2%
+2. **Filter** — Minimum funding (`MIN_FUNDING_RATE_TO_OPEN`), minimum 24h quote volume per leg (`MIN_VOLUME_USD`), and optional leg-balance filter (`MIN_LEG_VOLUME_RATIO`) so spot and futures liquidity are not wildly mismatched
+3. **Rank** — Sort by funding rate descending, select top `TOP_N` candidates (default 3)
+4. **Pre-trade checks** — Deep orderbook VWAP simulation (`ORDER_BOOK_LIMIT`); abort if worst-case slip or cross-venue basis exceeds `MAX_SLIPPAGE_PCT` (default 0.2%)
 5. **Execute** — Concurrently fire Market BUY (Spot) + Market SELL (Futures) via `asyncio.gather` to minimise legging risk
 6. **Monitor** — Every 8 hours, evaluate exit triggers and unwind positions when carry deteriorates
 7. **Alert** — Send execution summaries to Telegram (entry prices, slippage, projected APY)
@@ -52,8 +52,9 @@ Long Spot  +  Short Perpetual  =  Zero directional exposure, collect funding
 
 | Protection | Description |
 |---|---|
-| **Slippage guard** | Aborts if expected slippage > 0.2% based on orderbook depth |
-| **Volume filter** | Requires $50M+ 24h volume on both spot and futures legs |
+| **Slippage guard** | Aborts if VWAP simulation or cross-venue basis exceeds `MAX_SLIPPAGE_PCT` (env, default 0.2%) |
+| **Volume filter** | Each leg must meet `MIN_VOLUME_USD` (env, default $25M — was $50M hardcoded) |
+| **Leg liquidity balance** | Optional `MIN_LEG_VOLUME_RATIO` rejects pairs where one venue is much thinner (reduces bad fills on hype perps) |
 | **Concurrent execution** | `asyncio.gather` fires both legs simultaneously to minimise legging risk |
 | **Leg failure handling** | If one leg fills and the other fails, raises `LegExecutionError` with immediate Telegram alert |
 | **Minimum hold period** | Configurable `MIN_HOLD_HOURS` prevents fee-churning on short-lived positions |
@@ -115,13 +116,18 @@ DRY_RUN=true ./run.sh
 All parameters are controlled via environment variables (see `.env.example`):
 
 ```bash
-CAPITAL_PER_LEG_USD=1000        # USD per side per position ($2k total per coin)
-MIN_FUNDING_RATE_TO_OPEN=0.00013  # ~14.2% APY minimum to open
-MIN_FUNDING_RATE_TO_HOLD=0.00004  # ~4.4% APY minimum to hold
-MIN_HOLD_HOURS=24                 # Minimum hold before non-emergency exit
-BLACKLIST_SYMBOLS=BNB             # Comma-separated, never trade these
-DRY_RUN=false                     # true = simulate without placing orders
-USE_TESTNET=false                 # true = route to Binance testnet
+CAPITAL_PER_LEG_USD=1000           # USD per side per position ($2k total per coin)
+TOP_N=3                             # Max new names considered per cycle (ranked by funding)
+MIN_VOLUME_USD=25000000            # $25M default per leg (raise for stricter liquidity)
+MIN_LEG_VOLUME_RATIO=0.2           # Min min(spot,fut)/max(...); 0 = off; higher = stricter balance
+MAX_SLIPPAGE_PCT=0.002             # Abort pre-trade if slip/basis worse than 0.2% (lower = safer, fewer trades)
+ORDER_BOOK_LIMIT=40                # Order book levels for VWAP simulation
+MIN_FUNDING_RATE_TO_OPEN=0.00008   # ~8.8% gross APY floor to open (raise if too many low-quality fills)
+MIN_FUNDING_RATE_TO_HOLD=0.00004   # ~4.4% APY minimum to keep holding
+MIN_HOLD_HOURS=24
+BLACKLIST_SYMBOLS=BNB
+DRY_RUN=false
+USE_TESTNET=false
 ```
 
 ## Tech Stack
