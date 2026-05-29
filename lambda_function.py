@@ -54,6 +54,15 @@ logger.setLevel(logging.INFO)
 # USD notional per leg (spot buy = $1k, futures short = $1k → $2k total per symbol)
 CAPITAL_PER_LEG_USD: float = float(os.environ.get("CAPITAL_PER_LEG_USD", "1000.0"))
 
+# Extra headroom on each leg for fees / rounding (fraction, e.g. 0.02 = 2%).
+BALANCE_BUFFER_PCT: float = float(os.environ.get("BALANCE_BUFFER_PCT", "0.02"))
+
+# If true, scale each leg down to min(spot,futures) USDT free instead of failing.
+AUTO_SCALE_LEG: bool = os.environ.get("AUTO_SCALE_LEG", "true").lower() == "true"
+
+# Do not open if scaled leg notional would fall below this USD floor.
+MIN_LEG_USD: float = float(os.environ.get("MIN_LEG_USD", "50.0"))
+
 # Number of top-ranked candidates to trade
 TOP_N: int = int(os.environ.get("TOP_N", "3"))
 
@@ -332,6 +341,65 @@ async def fetch_top_candidates(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 1.5 — Wallet Balance Pre-Check (prevent leg imbalance)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def fetch_wallet_usdt_free(
+    spot_ex: ccxt.binance,
+    futures_ex: ccxt.binance,
+) -> tuple[float, float]:
+    """Return (spot_usdt_free, futures_usdt_free)."""
+    spot_bal, fut_bal = await asyncio.gather(
+        spot_ex.fetch_balance(),
+        futures_ex.fetch_balance(),
+    )
+    spot_free = float(spot_bal.get("USDT", {}).get("free") or 0.0)
+    fut_free = float(fut_bal.get("USDT", {}).get("free") or 0.0)
+    return spot_free, fut_free
+
+
+async def resolve_leg_notional_usd(
+    spot_ex: ccxt.binance,
+    futures_ex: ccxt.binance,
+    requested_usd: float,
+) -> tuple[float | None, str]:
+    """
+    Ensure both spot and futures wallets can fund the leg before any order.
+
+    Returns (effective_usd, error_reason). effective_usd is None if trade must abort.
+    """
+    spot_free, fut_free = await fetch_wallet_usdt_free(spot_ex, futures_ex)
+    buffer = 1.0 + BALANCE_BUFFER_PCT
+    required = requested_usd * buffer
+
+    if AUTO_SCALE_LEG:
+        max_affordable = min(spot_free, fut_free) / buffer
+        if max_affordable < MIN_LEG_USD:
+            return None, (
+                f"Insufficient balance for min leg ${MIN_LEG_USD:.0f}: "
+                f"Spot USDT free=${spot_free:.2f}, Futures USDT free=${fut_free:.2f} "
+                f"(need ${required:.2f} for ${requested_usd:.2f} leg incl. {BALANCE_BUFFER_PCT*100:.0f}% buffer)"
+            )
+        effective = min(requested_usd, max_affordable)
+        if effective < requested_usd - 0.01:
+            logger.warning(
+                f"Scaling leg from ${requested_usd:.2f} → ${effective:.2f} "
+                f"(Spot free=${spot_free:.2f}, Futures free=${fut_free:.2f})"
+            )
+        return effective, ""
+
+    if spot_free < required or fut_free < required:
+        return None, (
+            f"Insufficient balance: Spot USDT free=${spot_free:.2f}, "
+            f"Futures USDT free=${fut_free:.2f}, need ${required:.2f} per leg "
+            f"(${requested_usd:.2f} + {BALANCE_BUFFER_PCT*100:.0f}% buffer). "
+            f"Transfer USDT or lower CAPITAL_PER_LEG_USD / enable AUTO_SCALE_LEG."
+        )
+    return requested_usd, ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 — Pre-Trade Slippage & Spread Check
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -340,10 +408,11 @@ async def check_slippage_and_bbo(
     spot_ex: ccxt.binance,
     futures_ex: ccxt.binance,
     candidate: TradeCandidate,
+    leg_usd: float,
 ) -> tuple[bool, float, float, float]:
     """
     Fetch the Level-2 orderbook for both legs and simulate the VWAP fill price
-    for a CAPITAL_PER_LEG_USD market order.
+    for a leg_usd market order.
 
     Returns:
         ok            — True if combined slippage is within MAX_SLIPPAGE_PCT
@@ -398,8 +467,8 @@ async def check_slippage_and_bbo(
     if not spot_asks or not futures_bids:
         raise RuntimeError(f"Empty orderbook returned for {candidate.symbol}")
 
-    spot_vwap, spot_best_ask = _simulate_vwap(spot_asks, CAPITAL_PER_LEG_USD)
-    futures_vwap, futures_best_bid = _simulate_vwap(futures_bids, CAPITAL_PER_LEG_USD)
+    spot_vwap, spot_best_ask = _simulate_vwap(spot_asks, leg_usd)
+    futures_vwap, futures_best_bid = _simulate_vwap(futures_bids, leg_usd)
 
     # ── Slippage Components ────────────────────────────────────────────────
     # Spot slippage: how much worse is our VWAP vs the innermost ask?
@@ -498,6 +567,7 @@ async def execute_delta_neutral_trade(
     spot_ref_price: float,    # From VWAP simulation — used for qty calculation only
     futures_ref_price: float,
     slippage_pct: float,
+    leg_usd: float,
 ) -> TradeResult:
     """
     Fire both legs concurrently via asyncio.gather to minimise the time window
@@ -509,7 +579,7 @@ async def execute_delta_neutral_trade(
       3. Dispatch spot BUY + futures SELL simultaneously
       4. Inspect results: both ok → record; one ok → LegExecutionError; both fail → RuntimeError
     """
-    raw_qty = CAPITAL_PER_LEG_USD / spot_ref_price
+    raw_qty = leg_usd / spot_ref_price
 
     # Apply precision formatting BEFORE sending — Binance will reject otherwise
     spot_qty = fmt_amount(spot_ex, candidate.spot_symbol, raw_qty)
@@ -540,6 +610,16 @@ async def execute_delta_neutral_trade(
             projected_apy=projected_apy,
             spot_order_id="DRY_RUN_SPOT",
             futures_order_id="DRY_RUN_FUTURES",
+        )
+
+    # Final balance gate immediately before dispatch (avoid legging if wallets moved)
+    spot_free, fut_free = await fetch_wallet_usdt_free(spot_ex, futures_ex)
+    need = leg_usd * (1.0 + BALANCE_BUFFER_PCT)
+    if spot_free < need or fut_free < need:
+        raise RuntimeError(
+            f"[{candidate.symbol}] Balance insufficient at dispatch: "
+            f"Spot USDT=${spot_free:.2f}, Futures USDT=${fut_free:.2f}, "
+            f"need ${need:.2f} for ${leg_usd:.2f} leg — aborting before any order."
         )
 
     # Build coroutines (do not await yet — we'll launch them together below)
@@ -763,13 +843,23 @@ async def run_strategy() -> None:
                 skipped.append((candidate.symbol, reason))
                 continue
 
+            # Phase 1.6: Both wallets must fund the leg (scale down if AUTO_SCALE_LEG)
+            leg_usd, bal_reason = await resolve_leg_notional_usd(
+                spot_ex, futures_ex, CAPITAL_PER_LEG_USD
+            )
+            if leg_usd is None:
+                logger.warning(f"SKIP {candidate.symbol}: {bal_reason}")
+                skipped.append((candidate.symbol, bal_reason))
+                await _post_telegram(_fmt_abort_alert(candidate.symbol, bal_reason))
+                continue
+
             # Phase 2: Enforce futures margin mode + 1x leverage
             await configure_futures_margin(futures_ex, candidate.futures_symbol)
 
             # Phase 3: Slippage check — gate before any order is placed
             try:
                 ok, spot_price, futures_price, slippage = await check_slippage_and_bbo(
-                    spot_ex, futures_ex, candidate
+                    spot_ex, futures_ex, candidate, leg_usd
                 )
             except Exception as exc:
                 reason = f"Orderbook error: {exc}"
@@ -795,6 +885,7 @@ async def run_strategy() -> None:
                     candidate,
                     spot_price, futures_price,
                     slippage,
+                    leg_usd,
                 )
                 results.append(result)
 

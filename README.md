@@ -56,6 +56,7 @@ Long Spot  +  Short Perpetual  =  Zero directional exposure, collect funding
 | **Volume filter** | Each leg must meet `MIN_VOLUME_USD` (env, default $25M — was $50M hardcoded) |
 | **Leg liquidity balance** | Optional `MIN_LEG_VOLUME_RATIO` rejects pairs where one venue is much thinner (reduces bad fills on hype perps) |
 | **Cross margin (default)** | `FUTURES_MARGIN_MODE=cross` uses shared futures USDT wallet — avoids isolated-wallet `-2019` legging failures |
+| **Dual-wallet pre-check** | Verifies Spot + Futures USDT before orders; `AUTO_SCALE_LEG` downsizes to affordable notional |
 | **Concurrent execution** | `asyncio.gather` fires both legs simultaneously to minimise legging risk |
 | **Leg failure handling** | If one leg fills and the other fails, raises `LegExecutionError` with immediate Telegram alert |
 | **Minimum hold period** | Configurable `MIN_HOLD_HOURS` prevents fee-churning on short-lived positions |
@@ -117,7 +118,10 @@ DRY_RUN=true ./run.sh
 All parameters are controlled via environment variables (see `.env.example`):
 
 ```bash
-CAPITAL_PER_LEG_USD=1000           # USD per side per position ($2k total per coin)
+CAPITAL_PER_LEG_USD=1000           # Target USD per side (may scale down if AUTO_SCALE_LEG)
+BALANCE_BUFFER_PCT=0.02            # Extra USDT headroom per leg for fees (2%)
+AUTO_SCALE_LEG=true                # Scale leg to min(spot,futures) free instead of legging
+MIN_LEG_USD=50                     # Skip if scaled leg would be below this
 TOP_N=3                             # Max new names considered per cycle (ranked by funding)
 MIN_VOLUME_USD=25000000            # $25M default per leg (raise for stricter liquidity)
 MIN_LEG_VOLUME_RATIO=0.2           # Min min(spot,fut)/max(...); 0 = off; higher = stricter balance
