@@ -55,6 +55,7 @@ Long Spot  +  Short Perpetual  =  Zero directional exposure, collect funding
 | **Slippage guard** | Aborts if VWAP simulation or cross-venue basis exceeds `MAX_SLIPPAGE_PCT` (env, default 0.2%) |
 | **Volume filter** | Each leg must meet `MIN_VOLUME_USD` (env, default $25M — was $50M hardcoded) |
 | **Leg liquidity balance** | Optional `MIN_LEG_VOLUME_RATIO` rejects pairs where one venue is much thinner (reduces bad fills on hype perps) |
+| **Cross margin (default)** | `FUTURES_MARGIN_MODE=cross` uses shared futures USDT wallet — avoids isolated-wallet `-2019` legging failures |
 | **Concurrent execution** | `asyncio.gather` fires both legs simultaneously to minimise legging risk |
 | **Leg failure handling** | If one leg fills and the other fails, raises `LegExecutionError` with immediate Telegram alert |
 | **Minimum hold period** | Configurable `MIN_HOLD_HOURS` prevents fee-churning on short-lived positions |
@@ -121,7 +122,8 @@ TOP_N=3                             # Max new names considered per cycle (ranked
 MIN_VOLUME_USD=25000000            # $25M default per leg (raise for stricter liquidity)
 MIN_LEG_VOLUME_RATIO=0.2           # Min min(spot,fut)/max(...); 0 = off; higher = stricter balance
 MAX_SLIPPAGE_PCT=0.002             # Abort pre-trade if slip/basis worse than 0.2% (lower = safer, fewer trades)
-ORDER_BOOK_LIMIT=40                # Order book levels for VWAP simulation
+ORDER_BOOK_LIMIT=50                # Binance-valid depth: 5,10,20,50,100,500,1000
+FUTURES_MARGIN_MODE=cross          # cross | isolated (cross recommended)
 MIN_FUNDING_RATE_TO_OPEN=0.00008   # ~8.8% gross APY floor to open (raise if too many low-quality fills)
 MIN_FUNDING_RATE_TO_HOLD=0.00004   # ~4.4% APY minimum to keep holding
 MIN_HOLD_HOURS=24

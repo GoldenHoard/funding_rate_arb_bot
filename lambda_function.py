@@ -70,13 +70,22 @@ MIN_LEG_VOLUME_RATIO: float = float(os.environ.get("MIN_LEG_VOLUME_RATIO", "0.2"
 MAX_SLIPPAGE_PCT: float = float(os.environ.get("MAX_SLIPPAGE_PCT", "0.002"))
 
 # Order book depth levels for VWAP simulation (more levels = stabler estimate on wide books).
-ORDER_BOOK_LIMIT: int = int(os.environ.get("ORDER_BOOK_LIMIT", "40"))
+ORDER_BOOK_LIMIT: int = int(os.environ.get("ORDER_BOOK_LIMIT", "50"))
 
 # Minimum 8h funding rate required to OPEN a new position.
 # Default: 0.00008 ≈ ~8.8% gross APY (before fees/slippage). Tune MIN_FUNDING_RATE_TO_OPEN in .env.
 MIN_FUNDING_RATE_TO_OPEN: float = float(
     os.environ.get("MIN_FUNDING_RATE_TO_OPEN", "0.00008")
 )
+
+# Futures margin mode: "cross" (default) or "isolated".
+# Cross uses the shared USDT wallet — avoids -2019 when isolated wallets are unfunded.
+_margin_mode_raw: str = os.environ.get("FUTURES_MARGIN_MODE", "cross").strip().lower()
+if _margin_mode_raw not in ("cross", "isolated"):
+    raise ValueError(
+        f"FUTURES_MARGIN_MODE must be 'cross' or 'isolated', got '{_margin_mode_raw}'"
+    )
+FUTURES_MARGIN_MODE: str = _margin_mode_raw
 
 # Binance pays/charges funding every 8 hours → 3 × 365 periods per year
 FUNDING_PERIODS_PER_YEAR: int = 3 * 365
@@ -451,21 +460,21 @@ async def configure_futures_margin(
     futures_symbol: str,
 ) -> None:
     """
-    Enforce isolated margin + 1x leverage before placing any order.
+    Enforce margin mode (cross or isolated) + 1x leverage before placing any order.
 
-    Why isolated over cross? At 1x leverage our spot position fully hedges the
-    futures short, but isolated margin caps the maximum loss to the posted
-    margin if something goes wrong, preventing contagion to other positions.
+    Default is cross: all USDT in the futures wallet is available as margin,
+    which prevents -2019 "Margin is insufficient" when isolated sub-wallets
+    are empty. Set FUTURES_MARGIN_MODE=isolated in .env to revert.
     """
     if DRY_RUN:
         logger.info(f"[DRY-RUN] Skipping margin/leverage config for {futures_symbol}")
         return
     try:
         # set_margin_mode raises if already in this mode on some accounts — swallow it
-        await futures_ex.set_margin_mode("isolated", futures_symbol)
-        logger.info(f"Margin mode → ISOLATED for {futures_symbol}")
+        await futures_ex.set_margin_mode(FUTURES_MARGIN_MODE, futures_symbol)
+        logger.info(f"Margin mode → {FUTURES_MARGIN_MODE.upper()} for {futures_symbol}")
     except ccxt.MarginModeAlreadySet:
-        logger.debug(f"Margin already isolated for {futures_symbol}")
+        logger.debug(f"Margin already {FUTURES_MARGIN_MODE} for {futures_symbol}")
     except Exception as exc:
         logger.warning(f"set_margin_mode warning ({futures_symbol}): {exc}")
 
@@ -754,7 +763,7 @@ async def run_strategy() -> None:
                 skipped.append((candidate.symbol, reason))
                 continue
 
-            # Phase 2: Enforce isolated margin + 1x leverage
+            # Phase 2: Enforce futures margin mode + 1x leverage
             await configure_futures_margin(futures_ex, candidate.futures_symbol)
 
             # Phase 3: Slippage check — gate before any order is placed
